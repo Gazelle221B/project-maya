@@ -7793,7 +7793,9 @@ struct Model::Impl {
             for (int t : run.T) run_n += t;
             c.buffered = run_n <= buf_max;
             if (!c.fl_layers.empty()) {
-                flow_spec(c, 0, c.fl_layers[0], run.T[0]);
+                // A group starting at the YOCO source has only KV work before the cut: no flow_layer to advance it.
+                const int il = c.fl_layers[0], k = run.yoco >= 0 && il >= run.yoco ? run.cut_k : 0;
+                flow_spec(c, k, il, fl_rows(c, k, il));
                 if (!flow_pump(c, err)) return false;
             }
             if (c.lm) return run_dev_layers(di, run, err);
@@ -8490,7 +8492,8 @@ struct Model::Impl {
 
     // the first layer of a long prompt's second half (forward_chunks' two passes), or -1: the first with compress ratio 1
     // (V4.1: 20), every one after it ratio 1 too and owning no compressed KV or index keys of its own (they read its),
-    // every trunk layer on one GPU.  The settings' MAYA_DS4_PROMPT_SKIP (STRATA_DS4_PROMPT_SKIP; DS4_YOCO for tests):
+    // its suffix on one GPU (the earlier layers may be split).  The settings' MAYA_DS4_PROMPT_SKIP
+    // (STRATA_DS4_PROMPT_SKIP; DS4_YOCO for tests):
     // 1 (the default) the exact skip, 2 DeepSeek's own serving's (the last 128 rows only: faster, the answers shift a
     // little), 0 off
     static int yoco_mode() {
@@ -8509,7 +8512,10 @@ struct Model::Impl {
         if (yl <= 0 || !L[(size_t) yl].kv_src) return -1;
         for (int il = 0; il < g.nl; ++il) {
             const Layer& l = L[(size_t) il];
-            if (l.nm != 1 || l.dev != L[0].dev) return -1;
+            if (l.nm != 1) return -1;
+            // Earlier groups still hand off every input row: the source layer needs them for its kv_only work.
+            // Keep the suffix together: a skipped chunk must not leave remote KV readers or hand-offs unacknowledged.
+            if (il >= yl && l.dev != L[(size_t) yl].dev) return -1;
             if (il > yl && (g.ratios[(size_t) il] != 1 || l.kv_src)) return -1;
         }
         return yl;
@@ -8535,7 +8541,7 @@ struct Model::Impl {
         // order).  The chunks stay as they are: the ones before the cut go through the layers before yoco and its
         // kv_only, the cut's chunk through those over all its rows and through the rest from the cut on (Run::r0, a
         // view of its buffers), the chunks after it through every layer - each layer's experts read as without the
-        // skip.  One GPU (DS4_YOCO=1; 0: off); not with every row's logits (tests)
+        // skip.  The suffix on one GPU (DS4_YOCO=1; 0: off); not with every row's logits (tests)
         const int yl = logits_rows > kWin ? -1 : yoco_layer();
         // (DS4_YOCO_KEEP=<rows>: fewer - DeepSeek's own serving replays the last 128 tokens through those layers
         //  (DeepInfer's "SWA bounded replay"), which shifts the answers a little; at least one window)
@@ -8555,6 +8561,9 @@ struct Model::Impl {
             run.yoco = yl;
             run.cut_k = a / per;
             run.cut_r = a - run.cut_k * per;
+            if (o.verbose)
+                std::fprintf(stderr, "ds4: prompt skip: layers %d-%d on CUDA%d, %d early rows KV-only, %d kept\n",
+                             yl, g.nl - 1, devs[(size_t) L[(size_t) yl].dev].id, a, n - a);
         }
         logits_all = logits_rows > kWin;
         if (logits_all) chunk_logits.resize((size_t) n * g.vocab);
