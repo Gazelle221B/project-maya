@@ -18,18 +18,22 @@ class PromptSkipTests(unittest.TestCase):
         if compiler is None:
             self.skipTest("a host C++ compiler is needed")
         source = (Path(__file__).resolve().parents[1] / "src/ds4/ds4_model.cu").read_text()
-        start = source.index("    int yoco_layer() const {")
-        end = source.index("\n    }", start) + len("\n    }")
+        start = source.index("    bool yoco_one_gpu() const {")
+        layer = source.index("    int yoco_layer() const {", start)
+        end = source.index("\n    }", layer) + len("\n    }")
         method = source[start:end]
         fixture = r'''
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
-struct Layer { int nm = 1, dev = 0; bool kv_src = false; };
+struct Layer { int nm = 1, dev = 0, eg = -1; bool kv_src = false; };
+struct Chunk { bool flow = false; };
 struct Model {
     struct { int nl = 40; std::vector<int> ratios; } g;
     int chunk = 4096, mode = 1;
     std::vector<Layer> L;
+    Chunk streamed{true};
+    std::vector<Chunk*> chunks;
     Model() : L(40) {
         g.ratios.assign(40, 4);
         for (int i = 20; i < 40; ++i) g.ratios[(size_t)i] = 1;
@@ -57,17 +61,31 @@ int main() {
     Model many;
     for (int i = 0; i < 40; ++i) many.L[(size_t)i].dev = i < 10 ? 0 : i < 20 ? 1 : 2;
     check(many, 20, "several prefix groups");
-    // Do not opt remote suffix readers into chunks that would leave their acknowledgements missing.
+    // The flow streams a split's layers: only a suffix on one GPU keeps its readers' acknowledgements in step.
+    for (int boundary : {1, 10, 19, 20}) {
+        Model split;
+        for (int i = boundary; i < 40; ++i) split.L[(size_t)i].dev = 1;
+        split.chunks.push_back(&split.streamed);
+        check(split, 20, "prefix split, flow");
+    }
     for (int boundary : {21, 30, 39}) {
         Model split;
         for (int i = boundary; i < 40; ++i) split.L[(size_t)i].dev = 1;
-        check(split, -1, "suffix split");
+        check(split, 20, "suffix split, no flow");
+        split.chunks.push_back(&split.streamed);
+        check(split, -1, "suffix split, flow");
     }
     for (int layer : {0, 19, 20, 39}) {
         Model tp;
         tp.L[(size_t)layer].nm = 2;
-        check(tp, -1, "tensor parallel");
+        check(tp, 20, "tensor parallel, no flow");
+        tp.chunks.push_back(&tp.streamed);
+        check(tp, -1, "tensor parallel, flow");
     }
+    Model engram_one; engram_one.L[25].eg = 0; check(engram_one, 20, "Engram layer, one GPU");
+    Model engram_split; engram_split.L[25].eg = 0;
+    for (int i = 10; i < 40; ++i) engram_split.L[(size_t)i].dev = 1;
+    check(engram_split, -1, "Engram layer in a split's suffix");
     Model off; off.mode = 0; check(off, -1, "disabled");
     Model fast; fast.mode = 2; check(fast, 20, "bounded replay");
     Model windows; windows.chunk = 0; check(windows, -1, "window path");

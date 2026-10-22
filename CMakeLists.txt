@@ -289,6 +289,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME exl3_exllamav3 COMMAND exl3_test --exllamav3 ${CMAKE_CURRENT_SOURCE_DIR}/data/exl3-exllamav3)
     set_tests_properties(exl3_exllamav3 PROPERTIES TIMEOUT 60)
   endif()
+  # the batched rows' MoE pieces (the fused wait / fetch, the rows' CPU-lane waits, a group's experts each once)
+  # against the per-row kernels (random Q8_0 experts, no model)
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+    add_executable(glm_moe_rows_test tests/glm_moe_rows_test.cu)
+    target_link_libraries(glm_moe_rows_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_moe_rows_test COMMAND glm_moe_rows_test)
+    set_tests_properties(glm_moe_rows_test PROPERTIES TIMEOUT 60)
+  endif()
   # the INT8 latent records' FP16 reads against the plain conversion, every code x every scale (GPU, no model)
   if(STRATA_BUILD_TESTS)
     add_executable(glm_lat8_test tests/glm_lat8_test.cu)
@@ -342,6 +350,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # FMA changes tie results. The embedding gather also relies on separately rounded operations.
     set_source_files_properties(src/kernels/cuda/elementwise.cu src/kernels/cuda/quantize_act.cu
       PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    # EXL3: multiply-adds fused where the source writes them, not after inlining - otherwise a kernel's rounding
+    # depends on where the compiler inlined its GEMV, and a verify window's bits stop matching the token path's
+    set_source_files_properties(src/kernels/cuda/exl3.cu PROPERTIES COMPILE_OPTIONS "-ffp-contract=on")
   endif()
 
   set(STRATA_ORACLE_SOURCE_DIR "" CACHE PATH "Pinned llama.cpp source for independent CUDA parity tests")
@@ -401,8 +412,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
   endif()
   # --expert-profile-save's profile (rank_learned_profile, write_expert_profile) and the profile header's version
-  # (a version other than 1 is refused by its number): CPU only
-  foreach(_t expert_profile_save_test expert_profile_version_test)
+  # (a version other than 1 is refused by its number); the split decode's groups (split_groups): CPU only
+  foreach(_t expert_profile_save_test expert_profile_version_test split_groups_test)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/${_t}.cpp")
       enable_testing()
       add_executable(${_t} tests/core/${_t}.cpp)
@@ -436,10 +447,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # (CUDA, or HIP through include/strata/hip_compat as the GLM engine; Linux and Windows)
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(maya-ds4 src/ds4/ds4_main.cpp src/ds4/ds4_model.cu src/ds4/ds4_kernels.cu src/ds4/ds4_vision.cu
-                              src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp)
+                              src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
+                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp)
     target_include_directories(maya-ds4 PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
     target_link_libraries(maya-ds4 PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target}
                           ${_strata_gpu_blas_target})
+    if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)   # (the prompt path's dense GEMMs: ds4_lt.cu)
+      set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS STRATA_HIPBLASLT_AVAILABLE=1)
+      target_link_libraries(maya-ds4 PRIVATE roc::hipblaslt)
+    endif()
     if(NOT WIN32)   # mmap / mbind (NUMA)
       add_executable(ds4_cpu_bench tests/ds4_cpu_bench.cpp)
       target_link_libraries(ds4_cpu_bench PRIVATE strata_kernels_cpu)
@@ -454,7 +470,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # the GGUF kernels (BF16 matrices, MXFP4 experts) against a double-precision reference, and the packed KV caches
     # against the BF16 rows bit for bit (needs a GPU, no model)
     add_executable(ds4_gguf_test tests/ds4_gguf_test.cu src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu
-                                 src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_kernels.cu)
+                                 src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_kernels.cu
+                                 src/ds4/ds4_host_ar.cpp)
     target_include_directories(ds4_gguf_test PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
     target_link_libraries(ds4_gguf_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
   endif()
