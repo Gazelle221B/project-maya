@@ -1111,7 +1111,14 @@ __global__ void __launch_bounds__(1024) topk_seg_kernel(const float* __restrict_
 // the merge: only the segments' picks at or above the largest segment's k-th (the row's k-th is at least that) - into
 // shared memory in position order, then topk_block over them (all of the candidates when more than kMergeCap pass: with
 // 16K-position segments ~3% of a row pass, 8192 of them past 256K positions)
+// HIP devices can have only 64 KiB LDS per workgroup.  The merge also has
+// static LDS (including topk_block), so a 64 KiB dynamic buffer alone is too large.
+// A smaller staging buffer uses the existing full-candidate fallback when full.
+#if defined(STRATA_USE_HIP)
+constexpr int kMergeCap = 4096;
+#else
 constexpr int kMergeCap = 8192;
+#endif
 __global__ void __launch_bounds__(1024) topk_merge_kernel(Rows r, int P, int K, const float* __restrict__ sv,
                                                           const int* __restrict__ si, const int* __restrict__ sn,
                                                           const uint32_t* __restrict__ sk, const int* __restrict__ cand,
