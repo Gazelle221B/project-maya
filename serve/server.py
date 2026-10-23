@@ -1412,6 +1412,14 @@ class Service:
         # the special literals that stay text inside a message (frontend.mark_literals): every one the vocabulary has
         self.literals = literal_tags(getattr(tokenizer, "special_tokens", None))
 
+    def log_thinking_budget(self) -> None:
+        """A configured budget is only guaranteed by an engine advertising INFO think_budget=1.
+        Keep sending the keys to older GLM engines that implement them without advertising the capability."""
+        if self.think_budget:
+            supported = (getattr(self.engine, "info", None) or {}).get("think_budget") == 1
+            note = "engine-enforced" if supported else "engine support unadvertised; limit may be ignored"
+            print(f"[maya] thinking budget: {self.think_budget} tokens ({note})", flush=True)
+
     def check_request(self, req: dict) -> None:
         """A request's sampling fields and logit_bias, checked (a ValueError is the 400) and kept in the form the engine
         line takes, before anything is sent.  A logit_bias needs an engine that applies it (INFO logit_bias=1): an
@@ -4089,8 +4097,7 @@ def main() -> int:
               flush=True)
     svc.think_budget = int(cfg.get("thinking_budget", 32768) or 0) if svc.think_end_id is not None else 0
     svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
-    if svc.think_budget:
-        print(f"[maya] thinking budget: {svc.think_budget} tokens (then the answer)", flush=True)
+    svc.log_thinking_budget()
     svc.api_key = a.api_key or cfg.get("api_key", "")
     try:
         svc.cors_origins = parse_cors_origins(cfg.get("cors_origins"))

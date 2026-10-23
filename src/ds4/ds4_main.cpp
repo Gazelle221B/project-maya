@@ -12,6 +12,7 @@
 // that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
 // (the file: see read_pics); the state is shared only where the same picture sits at the same place.
 #include "ds4_model.hpp"
+#include "ds4_thinking_budget.hpp"
 #include "strata/platform/env_alias.hpp"
 
 #include <cuda_profiler_api.h>
@@ -231,6 +232,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
 
 struct Req {
     long long max_new = 0;
+    strata::ds4::ThinkBudget thinking;
     float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
     int top_k = 64;
     unsigned long long seed = 0;
@@ -329,6 +331,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
             break;
         }
         const std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
+        if (r.thinking.parse(k, v)) continue;
         if (k == "temperature") r.temperature = std::strtof(v.c_str(), nullptr);
         else if (k == "top_p") r.top_p = std::strtof(v.c_str(), nullptr);
         else if (k == "top_k") r.top_k = std::atoi(v.c_str());
@@ -349,6 +352,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min) {
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
+    std::printf("INFO think_budget=1\n");
     std::printf("READY %lld stop\n", (long long) m.max_context());
     std::fflush(stdout);
     std::fprintf(stderr, "maya ds4 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <pictures> <ids>; STOP, QUIT\n");
@@ -532,6 +536,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         m.checkpoint(0);
         const double t1 = now_ms();
         const strata::ds4::Stats sd = m.stats();   // (the decode's own counters: STAT lines, DONE's hit fields)
+        r.thinking.start(m.vocab());
         long long produced = 0;
         const char* finish = "length";
         const long long limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
@@ -608,6 +613,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             std::printf("T %d\n", tok);
             ++produced;
+            r.thinking.on_token(tok);
             if (produced % 8 == 0) stat_line();
             std::fflush(stdout);
             bool end = false;
@@ -618,23 +624,39 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             if (produced >= limit || m.pos() >= m.max_context()) break;
             if (got.empty()) {   // the next round: the drafts (if any) and the token after them
-                const int room = (int) std::min<long long>(limit - produced, m.max_context() - m.pos());
-                int off = 0, acc = 0;
-                // a round whose drafts were all below the confidence floor: the next one does without the drafter
-                // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
-                const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
-                if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
-                           r.min_p, r.seed, counter, got,
-                           off, acc, err, r.cum)) {
-                    std::fprintf(stderr, "ds4: %s\n", err.c_str());
-                    finish = "cancel";
-                    break;
+                // Do not verify/accept a draft past the reasoning boundary: verify has already fed its
+                // accepted prefix. Its last output stays unfed, so the forced delimiter can replace the
+                // next pick without rolling KV back (including the drafter's seeded state).
+                const int room = r.thinking.room(
+                    (int) std::min<long long>(limit - produced, m.max_context() - m.pos()), produced);
+                if (r.thinking.force(produced)) {
+                    if (!m.step(tok, true, err)) {
+                        std::fprintf(stderr, "ds4: %s\n", err.c_str());
+                        finish = "cancel";
+                        break;
+                    }
+                    ++counter; // the forced pick occupies the next sampling position
+                    got.push_back(r.thinking.end);
+                    cool = false;
+                    dump_rows();
+                } else {
+                    int off = 0, acc = 0;
+                    // a round whose drafts were all below the confidence floor: the next one does without the drafter
+                    // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
+                    const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
+                    if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
+                               r.min_p, r.seed, counter, got,
+                               off, acc, err, r.cum)) {
+                        std::fprintf(stderr, "ds4: %s\n", err.c_str());
+                        finish = "cancel";
+                        break;
+                    }
+                    d_off += off;
+                    d_acc += acc;
+                    cool = try_spec && off == 0;
+                    std::reverse(got.begin(), got.end());
+                    dump_rows();
                 }
-                d_off += off;
-                d_acc += acc;
-                cool = try_spec && off == 0;
-                std::reverse(got.begin(), got.end());
-                dump_rows();
             }
             tok = got.back();
             got.pop_back();

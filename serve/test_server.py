@@ -476,6 +476,17 @@ class SamplingKeys(unittest.TestCase):
     def keys(self, **sampling):
         return StrataEngine.sampling_keys(sampling).split()
 
+    def test_thinking_budget_keys(self):
+        for temperature in (0, 0.7):
+            with self.subTest(temperature=temperature):
+                keys = self.keys(temperature=temperature, _think_budget=512, _think_end=42)
+                self.assertIn("think_budget=512", keys)
+                self.assertIn("think_end=42", keys)
+                plain = StrataEngine.sampling_keys({"temperature": temperature})
+                for disabled in ({"_think_budget": 0, "_think_end": 42}, {"_think_budget": 512},
+                                 {"_think_end": 42}):
+                    self.assertEqual(StrataEngine.sampling_keys({"temperature": temperature, **disabled}), plain)
+
     def test_top_k(self):
         self.assertIn("top_k=10", self.keys(temperature=0.7, top_k=10))
         self.assertIn("top_k=64", self.keys(temperature=0.7, top_k=64))
@@ -550,6 +561,32 @@ class SamplingKeys(unittest.TestCase):
         self.assertIn("logit_bias=7:-100,42:2.5", self.keys(temperature=0.7, logit_bias={42: 2.5, 7: -100.0}))
         self.assertIn("logit_bias=3:1", self.keys(temperature=0, logit_bias={3: 1.0}))     # greedy keeps it too
         self.assertFalse([k for k in self.keys(temperature=0.7, logit_bias={}) if k.startswith("logit_bias")])
+
+
+class ThinkingBudgetLog(unittest.TestCase):
+    """Configuring a budget must not promise that an engine which ignores the keys enforces it."""
+
+    def test_reports_the_engine_capability(self):
+        import contextlib
+        import io
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "answer")
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.think_budget = 512
+        for info, expected in (({"think_budget": 1}, "engine-enforced"),
+                               ({}, "engine support unadvertised; limit may be ignored"),
+                               ({"think_budget": 0}, "engine support unadvertised; limit may be ignored")):
+            with self.subTest(info=info):
+                engine.info = info
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    svc.log_thinking_budget()
+                self.assertEqual(out.getvalue(), f"[maya] thinking budget: 512 tokens ({expected})\n")
+        svc.think_budget = 0
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            svc.log_thinking_budget()
+        self.assertEqual(out.getvalue(), "")
 
 
 class RequestChecks(unittest.TestCase):
